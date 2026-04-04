@@ -1,0 +1,152 @@
+HOW TO RUN (Port Scan Detection Tool)
+====================================
+
+Project: Port Scan Detection Tool (SYN Monitor) using Python + Scapy
+Purpose: Detect port-scan behavior by sniffing TCP SYN packets and alerting when:
+- Same source IP hits many different destination ports in a short window
+- Source IP shows sequential port scanning behavior (e.g., 20,21,22,23...)
+
+IMPORTANT
+---------
+1) Use this only on networks/systems you own or have permission to monitor.
+2) Packet sniffing usually requires sudo/root because it needs access to network interfaces.
+   Scapy documentation also shows using sudo for packet operations. [web:2]
+
+------------------------------------------------------------
+A) SETUP (LINUX) — one time
+------------------------------------------------------------
+
+Step A1: Open terminal inside the project folder
+Example:
+  cd Port-Scan-Detection-Tool
+
+Step A2: (Recommended) Create a Python virtual environment
+Command:
+  python3 -m venv .venv
+
+Explanation:
+  A virtual environment keeps dependencies (like scapy) isolated per project. [web:21]
+
+Step A3: Activate the virtual environment
+Command:
+  source .venv/bin/activate
+
+Explanation:
+  On Linux/macOS you activate venv using the 'source <venv>/bin/activate' command. [web:21]
+
+Step A4: Install dependencies
+Command:
+  pip install -r requirements.txt
+
+Explanation:
+  This installs Scapy, which we use to sniff TCP packets and analyze SYN traffic. [web:2]
+
+------------------------------------------------------------
+B) RUN THE DETECTOR (LIVE MONITORING)
+------------------------------------------------------------
+
+Step B1: Identify your network interface
+Common names: eth0, wlan0, enp0s3, wlp2s0
+
+Command:
+  ip a
+
+Explanation:
+  You must choose the correct interface to sniff traffic from your network card.
+
+Step B2: Run the detector (usually with sudo)
+Command:
+  sudo python3 port_scan_detector.py -i eth0
+
+Explanation:
+  Running with sudo helps avoid permission errors while sniffing packets. [web:2]
+
+------------------------------------------------------------
+C) RUN WITH CUSTOM SETTINGS (RECOMMENDED FOR DEMO)
+------------------------------------------------------------
+
+Command:
+  sudo python3 port_scan_detector.py -i eth0 --window 10 --unique-threshold 20 --sequential-threshold 10 --cooldown 30 --log logs/alerts.jsonl
+
+Explanation of flags:
+- --window 10
+  Sliding time window (in seconds) used to evaluate scanning behavior.
+- --unique-threshold 20
+  If one source IP hits >= 20 different ports inside the time window, raise alert.
+- --sequential-threshold 10
+  If one source IP hits a sequential run of >= 10 ports, raise alert.
+- --cooldown 30
+  Prevents repeated alert spam from the same IP for 30 seconds after an alert.
+- --log logs/alerts.jsonl
+  Saves alerts to a JSON Lines log file for later report/submission.
+
+------------------------------------------------------------
+D) OPTIONAL: VERIFY SYN PACKETS USING tcpdump (FOR REPORT/PROOF)
+------------------------------------------------------------
+
+D1: Show only TCP SYN packets on your interface
+Command:
+  sudo tcpdump -i eth0 "tcp[tcpflags] & (tcp-syn) != 0"
+
+Explanation:
+  This tcpdump filter captures TCP packets where the SYN flag is set. [web:7]
+
+Tip:
+  Keep tcpdump running in one terminal and run the detector in another terminal.
+
+------------------------------------------------------------
+E) GENERATE TEST TRAFFIC (ONLY IN AUTHORIZED ENVIRONMENT)
+------------------------------------------------------------
+
+From a second machine in the same network (attacker/test machine), run a scan:
+Example:
+  nmap -sS <target-ip>
+
+Explanation:
+  This creates SYN-based scans which your detector should catch as multiple-port or sequential scanning.
+
+If you don’t have a second machine:
+  You can scan your own machine, but results depend on routing and interface selection.
+
+------------------------------------------------------------
+F) WHAT YOU SHOULD SEE
+------------------------------------------------------------
+
+When scanning is detected, the detector prints something like:
+
+  [ALERT] src=192.168.1.50 unique_ports=25 window=10s reason=Many ports in 10s (>= 20) sample_ports=[22, 23, 24, ...]
+
+If logging is enabled, you should also get:
+  logs/alerts.jsonl
+
+------------------------------------------------------------
+G) STOP THE TOOL
+------------------------------------------------------------
+
+Press:
+  Ctrl + C
+
+Explanation:
+  Stops the live sniffing loop safely.
+
+------------------------------------------------------------
+H) COMMON ISSUES + FIXES
+------------------------------------------------------------
+
+1) "Permission denied" / no packets seen
+- Fix: Run with sudo:
+    sudo python3 port_scan_detector.py -i eth0
+- Reason: Sniffing often requires elevated privileges. [web:2]
+
+2) Wrong interface (no alerts)
+- Fix: Confirm interface with:
+    ip a
+  Then rerun with correct interface name.
+
+3) Dependency missing
+- Fix:
+    pip install -r requirements.txt
+
+------------------------------------------------------------
+END
+------------------------------------------------------------
