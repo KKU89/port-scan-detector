@@ -1,1 +1,5 @@
-scapy>=2.6.1
+# Requirements for Enhanced Port Scan Detection Tool
+# Install with: pip install -r requirements.txt
+
+# Packet capture and network analysis
+scapy>=2.5.0
