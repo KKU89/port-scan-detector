@@ -1,6 +1,8 @@
+# version 2 updated by ADITYA UPMANYU 
 #!/usr/bin/env python3
 """
 Enhanced Port Scan Detection Tool using Scapy
+Version: 2.1.0
 
 Detects:
 - Multiple ports accessed by the same source IP within a sliding time window
@@ -8,7 +10,7 @@ Detects:
 - Distributed scans from multiple sources
 - Various scan patterns (aggressive vs. slow scans)
 
-Enhancements:
+Enhancements over v1:
 - Root privilege validation
 - Memory management and cleanup
 - IP whitelisting
@@ -16,6 +18,10 @@ Enhancements:
 - Destination IP tracking
 - Better error handling
 - Performance optimizations
+- Named constants for magic numbers
+- Improved type annotations
+- Refined alert rate calculation
+- Structured startup banner
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
-from typing import Deque, Dict, Set, Tuple, Optional
+from typing import Deque, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
 try:
@@ -37,9 +43,41 @@ except ImportError:
     print("[!] Scapy not found. Install with: pip install scapy", file=sys.stderr)
     sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# TCP flag constants
+# ---------------------------------------------------------------------------
+TCP_FLAG_SYN: int = 0x02
+TCP_FLAG_ACK: int = 0x10
+
+# ---------------------------------------------------------------------------
+# Severity thresholds
+# ---------------------------------------------------------------------------
+SEVERITY_CRITICAL_PORTS: int = 50
+SEVERITY_CRITICAL_RATE: float = 20.0
+SEVERITY_HIGH_PORTS: int = 30
+SEVERITY_MEDIUM_PORTS: int = 20
+RAPID_SCAN_RATE_THRESHOLD: float = 10.0  # attempts/sec before "rapid" flag triggers
+
+# ---------------------------------------------------------------------------
+# Default configuration values
+# ---------------------------------------------------------------------------
+DEFAULT_WINDOW_SECONDS: int = 10
+DEFAULT_UNIQUE_PORT_THRESHOLD: int = 20
+DEFAULT_SEQUENTIAL_THRESHOLD: int = 10
+DEFAULT_COOLDOWN_SECONDS: int = 30
+DEFAULT_LOG_FILE: str = "logs/alerts.jsonl"
+DEFAULT_BPF_FILTER: str = "tcp"
+DEFAULT_CLEANUP_INTERVAL: int = 300
+DEFAULT_MAX_INACTIVE_TIME: int = 600
+MAX_SAMPLE_PORTS: int = 40
+MAX_DST_IPS_IN_ALERT: int = 10
+MAX_PORTS_PRINTED_IN_CONSOLE: int = 10
+
 
 @dataclass
 class Alert:
+    """Represents a single port-scan detection alert."""
+
     ts: float
     timestamp: str
     src_ip: str
@@ -47,25 +85,42 @@ class Alert:
     window_seconds: int
     reason: str
     severity: str
-    sample_ports: list[int]
-    dst_ips: list[str]
+    sample_ports: List[int]
+    dst_ips: List[str]
     total_attempts: int
 
 
 class PortScanDetector:
+    """
+    Stateful port-scan detector that processes raw TCP/IP packets.
+
+    The detector maintains a sliding window of SYN packets per source IP
+    and fires alerts when configurable heuristics are exceeded:
+
+    1. **Unique-port threshold** – more than ``unique_port_threshold`` distinct
+       destination ports contacted within ``window_seconds``.
+    2. **Sequential pattern** – a run of ``sequential_threshold`` or more
+       consecutive port numbers in the window.
+    3. **Rapid scanning** – more than ``RAPID_SCAN_RATE_THRESHOLD`` SYN
+       packets per second from one source.
+
+    Alerts are suppressed per source IP for ``cooldown_seconds`` after the
+    first alert to avoid log spam.
+    """
+
     def __init__(
         self,
-        window_seconds: int = 10,
-        unique_port_threshold: int = 20,
-        sequential_threshold: int = 10,
-        cooldown_seconds: int = 30,
+        window_seconds: int = DEFAULT_WINDOW_SECONDS,
+        unique_port_threshold: int = DEFAULT_UNIQUE_PORT_THRESHOLD,
+        sequential_threshold: int = DEFAULT_SEQUENTIAL_THRESHOLD,
+        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
         log_file: Optional[str] = None,
         exec_cmd: Optional[str] = None,
-        bpf_filter: str = "tcp",
+        bpf_filter: str = DEFAULT_BPF_FILTER,
         whitelist_ips: Optional[Set[str]] = None,
-        cleanup_interval: int = 300,
-        max_inactive_time: int = 600,
-    ):
+        cleanup_interval: int = DEFAULT_CLEANUP_INTERVAL,
+        max_inactive_time: int = DEFAULT_MAX_INACTIVE_TIME,
+    ) -> None:
         self.window_seconds = window_seconds
         self.unique_port_threshold = unique_port_threshold
         self.sequential_threshold = sequential_threshold
@@ -73,7 +128,7 @@ class PortScanDetector:
         self.log_file = log_file
         self.exec_cmd = exec_cmd
         self.bpf_filter = bpf_filter
-        self.whitelist_ips = whitelist_ips or set()
+        self.whitelist_ips: Set[str] = whitelist_ips or set()
         self.cleanup_interval = cleanup_interval
         self.max_inactive_time = max_inactive_time
 
@@ -89,12 +144,16 @@ class PortScanDetector:
         # Last cleanup timestamp
         self.last_cleanup: float = time.time()
 
-        # Statistics
-        self.stats = {
+        # Runtime statistics
+        self.stats: Dict[str, int] = {
             "packets_processed": 0,
             "alerts_generated": 0,
             "whitelisted_filtered": 0,
         }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _cleanup_old(self, src_ip: str, now: float) -> None:
         """Remove entries outside the sliding window for a specific IP."""
@@ -103,7 +162,12 @@ class PortScanDetector:
             dq.popleft()
 
     def _cleanup_inactive_ips(self, now: float) -> None:
-        """Remove inactive IPs to prevent memory growth."""
+        """
+        Periodically evict inactive source IPs to prevent unbounded memory growth.
+
+        An IP is considered inactive when its most-recent recorded attempt is
+        older than ``max_inactive_time`` seconds, or its deque is empty.
+        """
         if (now - self.last_cleanup) < self.cleanup_interval:
             return
 
@@ -115,17 +179,12 @@ class PortScanDetector:
 
         for ip in inactive_ips:
             del self.attempts[ip]
-            if ip in self.last_alert:
-                del self.last_alert[ip]
+            self.last_alert.pop(ip, None)
 
-        # Cleanup scan targets
-        inactive_targets = [
-            dst_ip
-            for dst_ip, src_set in self.scan_targets.items()
-            if not src_set
-        ]
-        for dst_ip in inactive_targets:
-            del self.scan_targets[dst_ip]
+        # Cleanup empty scan-target entries
+        empty_targets = [dst for dst, srcs in self.scan_targets.items() if not srcs]
+        for dst in empty_targets:
+            del self.scan_targets[dst]
 
         self.last_cleanup = now
         if inactive_ips:
@@ -133,14 +192,17 @@ class PortScanDetector:
 
     @staticmethod
     def _is_syn_only(tcp_flags: int) -> bool:
-        """Check if packet is SYN without ACK (connection attempt)."""
-        SYN = 0x02
-        ACK = 0x10
-        return (tcp_flags & SYN) != 0 and (tcp_flags & ACK) == 0
+        """Return *True* if the packet carries SYN but not ACK (new connection attempt)."""
+        return bool(tcp_flags & TCP_FLAG_SYN) and not bool(tcp_flags & TCP_FLAG_ACK)
 
     @staticmethod
     def _has_sequential_run(ports: Set[int], min_len: int) -> bool:
-        """Detect sequential port scanning pattern."""
+        """
+        Detect a sequential port-scanning pattern.
+
+        Returns *True* when ``ports`` contains a run of at least ``min_len``
+        consecutive integers (e.g., {20, 21, 22, 23} with ``min_len=4``).
+        """
         if len(ports) < min_len:
             return False
         sorted_ports = sorted(ports)
@@ -155,143 +217,188 @@ class PortScanDetector:
         return False
 
     def _in_cooldown(self, src_ip: str, now: float) -> bool:
-        """Check if source IP is in alert cooldown period."""
+        """Return *True* when the source IP is still within the alert cooldown period."""
         last = self.last_alert.get(src_ip)
         return last is not None and (now - last) < self.cooldown_seconds
 
     def _determine_severity(
         self, unique_ports: int, is_sequential: bool, scan_rate: float
     ) -> str:
-        """Determine alert severity based on scan characteristics."""
-        if unique_ports >= 50 or scan_rate > 20:
+        """
+        Map scan characteristics to a severity label.
+
+        +----------+---------------------------------------------------------+
+        | Severity | Condition                                               |
+        +==========+=========================================================+
+        | CRITICAL | ≥50 unique ports **or** scan rate > 20 attempts/sec    |
+        +----------+---------------------------------------------------------+
+        | HIGH     | ≥30 unique ports **or** sequential pattern detected     |
+        +----------+---------------------------------------------------------+
+        | MEDIUM   | ≥20 unique ports                                        |
+        +----------+---------------------------------------------------------+
+        | LOW      | all other triggered conditions                          |
+        +----------+---------------------------------------------------------+
+        """
+        if unique_ports >= SEVERITY_CRITICAL_PORTS or scan_rate > SEVERITY_CRITICAL_RATE:
             return "CRITICAL"
-        elif unique_ports >= 30 or is_sequential:
+        if unique_ports >= SEVERITY_HIGH_PORTS or is_sequential:
             return "HIGH"
-        elif unique_ports >= 20:
+        if unique_ports >= SEVERITY_MEDIUM_PORTS:
             return "MEDIUM"
-        else:
-            return "LOW"
+        return "LOW"
+
+    # ------------------------------------------------------------------
+    # Alert emission
+    # ------------------------------------------------------------------
 
     def _emit_alert(self, alert: Alert) -> None:
-        """Generate and log security alert."""
-        # Console with color coding
-        severity_colors = {
-            "CRITICAL": "\033[91m",  # Red
-            "HIGH": "\033[93m",  # Yellow
-            "MEDIUM": "\033[94m",  # Blue
-            "LOW": "\033[92m",  # Green
+        """
+        Dispatch a security alert to all configured sinks.
+
+        Sinks:
+        - **stdout** – colour-coded one-liner.
+        - **JSONL log file** – append-only, one JSON object per line.
+        - **exec hook** – optional shell command with alert details exported
+          as environment variables (``PSD_*``).
+        """
+        severity_colors: Dict[str, str] = {
+            "CRITICAL": "\033[91m",  # bright red
+            "HIGH":     "\033[93m",  # yellow
+            "MEDIUM":   "\033[94m",  # blue
+            "LOW":      "\033[92m",  # green
         }
-        reset_color = "\033[0m"
+        reset = "\033[0m"
         color = severity_colors.get(alert.severity, "")
 
         print(
-            f"{color}[ALERT-{alert.severity}]{reset_color} "
+            f"{color}[ALERT-{alert.severity}]{reset} "
             f"src={alert.src_ip} "
             f"unique_ports={alert.unique_ports} "
             f"attempts={alert.total_attempts} "
             f"window={alert.window_seconds}s "
             f"reason={alert.reason} "
-            f"sample_ports={alert.sample_ports[:10]}"
+            f"sample_ports={alert.sample_ports[:MAX_PORTS_PRINTED_IN_CONSOLE]}"
         )
 
-        # Log file (JSON lines)
+        # JSONL log
         if self.log_file:
             try:
                 os.makedirs(os.path.dirname(self.log_file) or ".", exist_ok=True)
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(asdict(alert), ensure_ascii=False) + "\n")
-            except IOError as e:
-                print(f"[!] Failed to write to log file: {e}", file=sys.stderr)
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(asdict(alert), ensure_ascii=False) + "\n")
+            except OSError as exc:
+                print(f"[!] Failed to write to log file: {exc}", file=sys.stderr)
 
-        # Optional command hook
+        # Optional shell hook
         if self.exec_cmd:
             env = os.environ.copy()
             env.update(
                 {
-                    "PSD_SRC_IP": alert.src_ip,
+                    "PSD_SRC_IP":       alert.src_ip,
                     "PSD_UNIQUE_PORTS": str(alert.unique_ports),
-                    "PSD_REASON": alert.reason,
-                    "PSD_SEVERITY": alert.severity,
+                    "PSD_REASON":       alert.reason,
+                    "PSD_SEVERITY":     alert.severity,
                     "PSD_SAMPLE_PORTS": ",".join(map(str, alert.sample_ports)),
+                    "PSD_TIMESTAMP":    alert.timestamp,
                 }
             )
             try:
                 subprocess.Popen(
-                    self.exec_cmd, shell=True, env=env, 
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    self.exec_cmd,
+                    shell=True,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
-            except Exception as e:
-                print(f"[!] Failed to execute command hook: {e}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[!] Failed to execute command hook: {exc}", file=sys.stderr)
 
         self.stats["alerts_generated"] += 1
 
+    # ------------------------------------------------------------------
+    # Packet processing
+    # ------------------------------------------------------------------
+
     def process_packet(self, pkt) -> None:
-        """Process individual network packet."""
+        """
+        Callback invoked by Scapy for every captured packet.
+
+        Only SYN-only TCP packets that carry an IP layer are analysed.
+        All other packets are silently discarded.
+        """
         try:
             if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
                 return
 
-            ip = pkt[IP]
-            tcp = pkt[TCP]
+            ip_layer = pkt[IP]
+            tcp_layer = pkt[TCP]
 
             # Only consider SYN packets (new connection attempts)
-            if not self._is_syn_only(int(tcp.flags)):
+            if not self._is_syn_only(int(tcp_layer.flags)):
                 return
 
             now = time.time()
-            src_ip = ip.src
-            dst_ip = ip.dst
-            dst_port = int(tcp.dport)
+            src_ip: str = ip_layer.src
+            dst_ip: str = ip_layer.dst
+            dst_port: int = int(tcp_layer.dport)
 
             self.stats["packets_processed"] += 1
 
-            # Whitelist check
+            # Whitelist check – skip trusted sources
             if src_ip in self.whitelist_ips:
                 self.stats["whitelisted_filtered"] += 1
                 return
 
-            # Track attempt
+            # Record attempt and update target map
             self.attempts[src_ip].append((now, dst_port, dst_ip))
             self.scan_targets[dst_ip].add(src_ip)
 
+            # Expire old entries for this source
             self._cleanup_old(src_ip, now)
 
-            # Periodic cleanup
+            # Periodic global memory cleanup
             self._cleanup_inactive_ips(now)
 
-            # Compute stats in window
-            attempts_in_window = list(self.attempts[src_ip])
-            ports_in_window = [p for (_, p, _) in attempts_in_window]
-            dst_ips_in_window = list(set([d for (_, _, d) in attempts_in_window]))
+            # Aggregate window stats
+            window_entries = list(self.attempts[src_ip])
+            ports_in_window: List[int] = [p for (_, p, _) in window_entries]
+            dst_ips_in_window: List[str] = list({d for (_, _, d) in window_entries})
 
-            unique_ports_set = set(ports_in_window)
-            unique_ports = len(unique_ports_set)
-            total_attempts = len(attempts_in_window)
+            unique_ports_set: Set[int] = set(ports_in_window)
+            unique_ports: int = len(unique_ports_set)
+            total_attempts: int = len(window_entries)
+            scan_rate: float = (
+                total_attempts / self.window_seconds if self.window_seconds > 0 else 0.0
+            )
 
-            # Calculate scan rate (attempts per second)
-            scan_rate = total_attempts / self.window_seconds if self.window_seconds > 0 else 0
-
-            # Cooldown check
+            # Respect per-IP cooldown to avoid alert spam
             if self._in_cooldown(src_ip, now):
                 return
 
-            # Detection rules
-            reason = None
-            is_sequential = False
+            # ---- Detection rules ----------------------------------------
+            reason: Optional[str] = None
+            is_sequential: bool = False
 
             if unique_ports >= self.unique_port_threshold:
-                reason = f"Many unique ports ({unique_ports}) in {self.window_seconds}s"
+                reason = (
+                    f"Many unique ports ({unique_ports}) within {self.window_seconds}s window"
+                )
             elif self._has_sequential_run(unique_ports_set, self.sequential_threshold):
-                reason = f"Sequential scan pattern detected (run >= {self.sequential_threshold})"
+                reason = (
+                    f"Sequential scan pattern detected (run ≥ {self.sequential_threshold})"
+                )
                 is_sequential = True
 
-            # Additional detection: Rapid scanning
-            if scan_rate > 10:  # More than 10 attempts per second
-                reason = reason or f"Rapid scanning detected ({scan_rate:.1f} attempts/sec)"
+            # Rapid-fire scanning is an independent trigger
+            if scan_rate > RAPID_SCAN_RATE_THRESHOLD:
+                reason = reason or (
+                    f"Rapid scanning detected ({scan_rate:.1f} attempts/sec)"
+                )
+            # ---- End detection rules ------------------------------------
 
             if reason:
                 severity = self._determine_severity(unique_ports, is_sequential, scan_rate)
-                sample = sorted(unique_ports_set)[:40]
+                sample_ports = sorted(unique_ports_set)[:MAX_SAMPLE_PORTS]
 
                 alert = Alert(
                     ts=now,
@@ -301,49 +408,68 @@ class PortScanDetector:
                     window_seconds=self.window_seconds,
                     reason=reason,
                     severity=severity,
-                    sample_ports=sample,
-                    dst_ips=dst_ips_in_window[:10],
+                    sample_ports=sample_ports,
+                    dst_ips=dst_ips_in_window[:MAX_DST_IPS_IN_ALERT],
                     total_attempts=total_attempts,
                 )
 
                 self.last_alert[src_ip] = now
                 self._emit_alert(alert)
 
-        except Exception as e:
-            print(f"[!] Error processing packet: {e}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] Error processing packet: {exc}", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def print_stats(self) -> None:
-        """Print detection statistics."""
+        """Print a summary of runtime detection statistics to stdout."""
         print("\n[*] Detection Statistics:")
-        print(f"    Packets processed: {self.stats['packets_processed']}")
-        print(f"    Alerts generated: {self.stats['alerts_generated']}")
-        print(f"    Whitelisted filtered: {self.stats['whitelisted_filtered']}")
-        print(f"    Active tracked IPs: {len(self.attempts)}")
+        print(f"    Packets processed  : {self.stats['packets_processed']}")
+        print(f"    Alerts generated   : {self.stats['alerts_generated']}")
+        print(f"    Whitelisted skipped: {self.stats['whitelisted_filtered']}")
+        print(f"    Active tracked IPs : {len(self.attempts)}")
+
+    def _print_banner(self, iface: Optional[str]) -> None:
+        """Print startup information banner."""
+        sep = "-" * 52
+        print(sep)
+        print("  Enhanced Port Scan Detection Tool  v2.1.0")
+        print(sep)
+        print(f"  Interface         : {iface or 'default'}")
+        print(f"  BPF filter        : {self.bpf_filter}")
+        print(f"  Unique port thr.  : {self.unique_port_threshold}")
+        print(f"  Sequential thr.   : {self.sequential_threshold}")
+        print(f"  Time window       : {self.window_seconds}s")
+        print(f"  Alert cooldown    : {self.cooldown_seconds}s")
+        print(f"  Whitelisted IPs   : {len(self.whitelist_ips)}")
+        if self.log_file:
+            print(f"  Log file          : {self.log_file}")
+        if self.exec_cmd:
+            print(f"  Exec hook         : {self.exec_cmd}")
+        print(sep)
+        print("  Press Ctrl+C to stop\n")
 
     def run(self, iface: Optional[str] = None) -> None:
-        """Start packet sniffing and detection."""
-        # Check root privileges
-        if os.name != 'nt' and os.geteuid() != 0:
+        """
+        Start packet sniffing and begin detection.
+
+        Requires ``CAP_NET_RAW`` (or root on Linux/macOS).  On Windows the
+        privilege check is skipped – Scapy itself will raise an appropriate
+        error if permissions are insufficient.
+        """
+        if os.name != "nt" and os.geteuid() != 0:
             print(
-                "[!] This tool requires root/sudo privileges for packet capture.",
+                "[!] Root/sudo privileges are required for packet capture.",
                 file=sys.stderr,
             )
             print("[!] Run with: sudo python3 port_scan_detector.py", file=sys.stderr)
             sys.exit(1)
 
-        # Disable Scapy verbose output
-        conf.verb = 0
+        conf.verb = 0  # Suppress Scapy verbose output
 
-        print("[*] Enhanced Port Scan Detection Tool started")
-        print(f"[*] Interface: {iface or 'default'}")
-        print(f"[*] BPF filter: {self.bpf_filter}")
-        print(f"[*] Unique port threshold: {self.unique_port_threshold}")
-        print(f"[*] Sequential threshold: {self.sequential_threshold}")
-        print(f"[*] Window: {self.window_seconds}s")
-        print(f"[*] Whitelisted IPs: {len(self.whitelist_ips)}")
-        if self.log_file:
-            print(f"[*] Logging to: {self.log_file}")
-        print("[*] Press Ctrl+C to stop\n")
+        self._print_banner(iface)
 
         try:
             sniff(
@@ -357,89 +483,141 @@ class PortScanDetector:
             self.print_stats()
         except PermissionError:
             print(
-                "[!] Permission denied. Ensure you have CAP_NET_RAW capability.",
+                "[!] Permission denied – ensure the process has CAP_NET_RAW capability.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        except Exception as e:
-            print(f"[!] Fatal error: {e}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] Fatal error: {exc}", file=sys.stderr)
             self.print_stats()
             raise
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
-    p = argparse.ArgumentParser(
-        description="Enhanced Port Scan Detection Tool (SYN-based) with Scapy",
+    """Parse and return command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Enhanced Port Scan Detection Tool (SYN-based) using Scapy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   sudo python3 port_scan_detector.py -i eth0
   sudo python3 port_scan_detector.py --window 15 --unique-threshold 25
   sudo python3 port_scan_detector.py --whitelist 192.168.1.100,10.0.0.5
+  sudo python3 port_scan_detector.py --log /var/log/psd/alerts.jsonl --exec "notify.sh"
         """,
     )
 
-    p.add_argument(
+    parser.add_argument(
         "-i", "--iface",
-        help="Network interface (e.g., eth0, wlan0). If omitted, uses default."
+        metavar="INTERFACE",
+        help="Network interface to capture on (e.g. eth0, wlan0). "
+             "Omit to use the system default.",
     )
-    p.add_argument(
-        "--window", type=int, default=10,
-        help="Sliding window in seconds (default: 10)"
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=DEFAULT_WINDOW_SECONDS,
+        metavar="SECONDS",
+        help=f"Sliding detection window in seconds (default: {DEFAULT_WINDOW_SECONDS})",
     )
-    p.add_argument(
-        "--unique-threshold", type=int, default=20,
-        help="Unique ports in window to trigger alert (default: 20)"
+    parser.add_argument(
+        "--unique-threshold",
+        type=int,
+        default=DEFAULT_UNIQUE_PORT_THRESHOLD,
+        metavar="N",
+        help=(
+            f"Number of unique destination ports within the window that triggers "
+            f"an alert (default: {DEFAULT_UNIQUE_PORT_THRESHOLD})"
+        ),
     )
-    p.add_argument(
-        "--sequential-threshold", type=int, default=10,
-        help="Sequential run length to trigger alert (default: 10)"
+    parser.add_argument(
+        "--sequential-threshold",
+        type=int,
+        default=DEFAULT_SEQUENTIAL_THRESHOLD,
+        metavar="N",
+        help=(
+            f"Minimum consecutive-port run length that triggers a sequential-scan "
+            f"alert (default: {DEFAULT_SEQUENTIAL_THRESHOLD})"
+        ),
     )
-    p.add_argument(
-        "--cooldown", type=int, default=30,
-        help="Cooldown in seconds per source IP (default: 30)"
+    parser.add_argument(
+        "--cooldown",
+        type=int,
+        default=DEFAULT_COOLDOWN_SECONDS,
+        metavar="SECONDS",
+        help=(
+            f"Per-source-IP alert cooldown in seconds to suppress duplicate alerts "
+            f"(default: {DEFAULT_COOLDOWN_SECONDS})"
+        ),
     )
-    p.add_argument(
-        "--log", default="logs/alerts.jsonl",
-        help="JSONL log file path (default: logs/alerts.jsonl, empty to disable)"
+    parser.add_argument(
+        "--log",
+        default=DEFAULT_LOG_FILE,
+        metavar="PATH",
+        help=(
+            f"Path to the JSONL alert log file. Pass an empty string to disable "
+            f"file logging (default: {DEFAULT_LOG_FILE})"
+        ),
     )
-    p.add_argument(
-        "--exec", dest="exec_cmd", default="",
-        help="Command to execute on alert (optional)"
+    parser.add_argument(
+        "--exec",
+        dest="exec_cmd",
+        default="",
+        metavar="CMD",
+        help="Shell command to execute on each alert. Alert details are passed "
+             "via PSD_* environment variables.",
     )
-    p.add_argument(
-        "--filter", default="tcp",
-        help='BPF filter for sniffing (default: "tcp")'
+    parser.add_argument(
+        "--filter",
+        default=DEFAULT_BPF_FILTER,
+        metavar="BPF",
+        help=f'Berkeley Packet Filter expression (default: "{DEFAULT_BPF_FILTER}")',
     )
-    p.add_argument(
-        "--whitelist", default="",
-        help="Comma-separated list of IPs to whitelist (e.g., 192.168.1.1,10.0.0.1)"
+    parser.add_argument(
+        "--whitelist",
+        default="",
+        metavar="IP[,IP...]",
+        help="Comma-separated list of source IPs to ignore (e.g. 192.168.1.1,10.0.0.1)",
     )
-    p.add_argument(
-        "--cleanup-interval", type=int, default=300,
-        help="Interval for memory cleanup in seconds (default: 300)"
+    parser.add_argument(
+        "--cleanup-interval",
+        type=int,
+        default=DEFAULT_CLEANUP_INTERVAL,
+        metavar="SECONDS",
+        help=(
+            f"How often (in seconds) inactive IPs are evicted from memory "
+            f"(default: {DEFAULT_CLEANUP_INTERVAL})"
+        ),
     )
-    p.add_argument(
-        "--max-inactive", type=int, default=600,
-        help="Max inactive time before IP cleanup in seconds (default: 600)"
+    parser.add_argument(
+        "--max-inactive",
+        type=int,
+        default=DEFAULT_MAX_INACTIVE_TIME,
+        metavar="SECONDS",
+        help=(
+            f"Maximum idle time (in seconds) before an IP is considered inactive "
+            f"and removed (default: {DEFAULT_MAX_INACTIVE_TIME})"
+        ),
     )
 
-    return p.parse_args()
+    return parser.parse_args()
 
 
 def main() -> None:
-    """Main entry point."""
+    """Entry point – parse arguments and start the detector."""
     args = parse_args()
 
-    log_file = args.log.strip() or None
-    exec_cmd = args.exec_cmd.strip() or None
+    log_file: Optional[str] = args.log.strip() or None
+    exec_cmd: Optional[str] = args.exec_cmd.strip() or None
 
-    # Parse whitelist
-    whitelist_ips = set()
+    whitelist_ips: Set[str] = set()
     if args.whitelist.strip():
-        whitelist_ips = set(ip.strip() for ip in args.whitelist.split(",") if ip.strip())
-        print(f"[*] Loaded {len(whitelist_ips)} whitelisted IPs")
+        whitelist_ips = {ip.strip() for ip in args.whitelist.split(",") if ip.strip()}
+        print(f"[*] Loaded {len(whitelist_ips)} whitelisted IP(s)")
 
     detector = PortScanDetector(
         window_seconds=args.window,
