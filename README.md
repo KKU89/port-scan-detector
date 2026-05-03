@@ -116,9 +116,10 @@ All alerts are saved in the `logs/` folder for later review.
 
 ## Use Cases
 
-* Learning cybersecurity basics
-* Understanding network scanning behavior
-* Small lab or personal network monitoring
+* Learning cybersecurity basics.
+* Understanding network scanning behavior.
+* Small lab or personal network monitoring.
+* Detecting suspicious pot scanning activities in local networks.
 
 ---
 
@@ -126,6 +127,8 @@ All alerts are saved in the `logs/` folder for later review.
 
 This project is for educational and ethical use only.
 Only run it on systems or networks where you have permission.
+This tool should be used only for authorized security testing purposes.
+
 
 ---
 
@@ -145,8 +148,11 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 
+
 ---
 
 ## Author
 
 ADITYA UPMANYU <Team Leader > 
+
+
