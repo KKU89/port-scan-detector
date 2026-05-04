@@ -28,7 +28,10 @@ When such behavior is detected, it raises an alert and logs the activity.
   * Rapid multi-port probing
 * Logs suspicious activity
 * Lightweight and beginner-friendly
-
+* Real-Time Traffic Monitoring: Utilizes packet sniffing to capture and analyze network traffic as it happens.
+*  Automated Alerting & Logging: Immediately raises an alert upon detection and stores all incident details (Source IP, scanned ports, and scan type) in the logs/
+  directory.
+* Customizable Thresholds: Allows users to modify sensitivity settings, such as time windows and detection limits, directly within the script.
 ---
 
 ## Project Structure
