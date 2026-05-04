@@ -107,7 +107,7 @@ class PortScanDetector:
     Alerts are suppressed per source IP for ``cooldown_seconds`` after the
     first alert to avoid log spam.
     """
-
+# MUSKAN RAWAT INTIALISIZE IT 
     def __init__(
         self,
         window_seconds: int = DEFAULT_WINDOW_SECONDS,
