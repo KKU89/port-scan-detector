@@ -1,3 +1,4 @@
+this project is in updation process 
 # Port Scan Detector
 
 A simple, real-time Network Intrusion Detection System (NIDS) built with Python and Scapy.
